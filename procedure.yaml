@@ -1,0 +1,209 @@
+name: BMS Protection Trip Verification
+version: 0.1.0
+description: Protection trip verification of a 16S BMS PCBA. Config read bit-exact, OV and UV trip point and delay on every channel by binary search on a cell simulator, OCD and SCD by sense-resistor voltage injection with the reset flags checked, over-temperature by two-point NTC substitution and open-thermistor fault, config re-read at teardown.
+
+unit:
+  auto_identify: true
+  serial_number:
+    description: "Scan the board data-matrix before it goes into the fixture"
+    placeholder: "BMS16-00000"
+    pattern: "^BMS16-\\d{5}$"
+    default_value: "BMS16-01743"
+  part_number:
+    default_value: "PCB-BMS-16S-R3"
+  batch_number:
+    default_value: "LOT-2026-37"
+
+plugs:
+  - name: Protection Bench
+    description: "Cell simulator, SRP/SRN injection source, programmable NTC resistor and DUT UART (mock, one plug per bench)"
+    python: plugs.protection_bench:ProtectionBench
+    key: bench
+    config:
+      cell_count: 16
+
+setup:
+  - name: Config Readback
+    key: config_readback
+    python: phases.config_readback
+    measurements:
+      - name: Protection Config
+        key: protection_config
+        description: Every protection register decoded to engineering units and compared as one object against the released configuration.
+        validators:
+          - operator: "=="
+            expected_value:
+              ov_mv: 4250
+              ov_delay_ms: 100
+              uv_mv: 2800
+              uv_delay_ms: 100
+              ocd1_mv: 60
+              ocd1_delay_ms: 40
+              scd_mv: 200
+              scd_delay_us: 15
+              otd_c: 60
+      - name: Config CRC
+        key: config_crc
+        validators:
+          - {operator: "==", expected_value: "0x3A7F"}
+
+main:
+  - name: OVP Trip
+    key: ovp_trip
+    python: phases.ovp_trip
+    timeout: 3m
+    measurements:
+      - name: OV Trips
+        key: ov_trips
+        title: Over-voltage trip point and ALERT delay per channel
+        x_axis:
+          legend: Channel
+        y_axis:
+          - legend: Trip point
+            key: trip
+            unit: mV
+            aggregations:
+              - type: max_dev_mv
+                unit: mV
+                validators:
+                  - {operator: "<=", expected_value: 30.0}
+              - type: min_dev_mv
+                unit: mV
+                validators:
+                  - {operator: ">=", expected_value: -30.0}
+          - legend: Delay
+            key: delay
+            unit: ms
+            aggregations:
+              - type: max_ms
+                unit: ms
+                validators:
+                  - {operator: "<=", expected_value: 107.0}
+
+  - name: UVP Trip
+    key: uvp_trip
+    python: phases.uvp_trip
+    depends_on: [ovp_trip]
+    timeout: 3m
+    measurements:
+      - name: UV Trips
+        key: uv_trips
+        title: Under-voltage trip point and ALERT delay per channel
+        x_axis:
+          legend: Channel
+        y_axis:
+          - legend: Trip point
+            key: trip
+            unit: mV
+            aggregations:
+              - type: max_dev_mv
+                unit: mV
+                validators:
+                  - {operator: "<=", expected_value: 30.0}
+              - type: min_dev_mv
+                unit: mV
+                validators:
+                  - {operator: ">=", expected_value: -30.0}
+          - legend: Delay
+            key: delay
+            unit: ms
+            aggregations:
+              - type: max_ms
+                unit: ms
+                validators:
+                  - {operator: "<=", expected_value: 107.0}
+
+  - name: Overcurrent Injection
+    key: overcurrent_injection
+    python: phases.overcurrent_injection
+    depends_on: [uvp_trip]
+    measurements:
+      - name: OCD1 Trip
+        key: ocd1_trip_mv
+        unit: mV
+        description: Setting 60 mV; the AFE's OC accuracy is +-5 mV in the 56-100 mV band.
+        validators:
+          - {operator: ">=", expected_value: 55.0}
+          - {operator: "<=", expected_value: 65.0}
+      - name: OCD1 Delay
+        key: ocd1_delay_ms
+        unit: ms
+        validators:
+          - {operator: "<=", expected_value: 47.0}
+      - name: SCD Trip
+        key: scd_trip_mv
+        unit: mV
+        description: Setting 200 mV, +-20 % (+-15 % datasheet plus fixture).
+        validators:
+          - {operator: ">=", expected_value: 160.0}
+          - {operator: "<=", expected_value: 240.0}
+      - name: SCD Response
+        key: scd_response_us
+        unit: µs
+        description: "Step to DSG gate off at +25 mV overdrive, 100 MS/s. The 15 us setting plus the input filter; without the stated overdrive the number means nothing."
+        validators:
+          - {operator: "<=", expected_value: 40.0}
+      - name: DSG Gate After SCD
+        key: dsg_gate_after_scd_v
+        unit: V
+        validators:
+          - {operator: "<=", expected_value: 1.0}
+      - name: Reset Flags After SCD
+        key: reset_flags_after_scd
+        description: "A device that rebooted on the SRP/SRN transient turns its FETs off too; only the POR and watchdog flags tell a trip from a crash."
+        validators:
+          - operator: "=="
+            expected_value:
+              por: false
+              wdt: false
+
+  - name: OTP Thermistor
+    key: otp_thermistor
+    python: phases.otp_thermistor
+    depends_on: [overcurrent_injection]
+    measurements:
+      - name: Temperature At 25 C
+        key: temp_at_25c
+        unit: °C
+        validators:
+          - {operator: ">=", expected_value: 23.0}
+          - {operator: "<=", expected_value: 27.0}
+      - name: Temperature At 60 C
+        key: temp_at_60c
+        unit: °C
+        description: "10 kOhm NTCs all read 25 C at 25 C; a B=3977 reel where B=3435 belongs reads 55 C here and trips OTD late."
+        validators:
+          - {operator: ">=", expected_value: 57.0}
+          - {operator: "<=", expected_value: 63.0}
+      - name: OTD Trip
+        key: otd_trip_c
+        unit: °C
+        validators:
+          - {operator: ">=", expected_value: 57.0}
+          - {operator: "<=", expected_value: 63.0}
+      - name: TS Open Flagged
+        key: ts_open_flagged
+        description: An open thermistor must raise a fault, not report a plausible temperature.
+        validators:
+          - {operator: "==", expected_value: true}
+
+teardown:
+  - name: Restore
+    key: restore
+    python: phases.restore
+    measurements:
+      - name: Faults After Restore
+        key: faults_after_restore
+        validators:
+          - operator: "=="
+            expected_value:
+              ov: []
+              uv: []
+              ocd1: false
+              scd: false
+              otd: false
+              ts_open: false
+      - name: Config CRC After
+        key: config_crc_after
+        validators:
+          - {operator: "==", expected_value: "0x3A7F"}
